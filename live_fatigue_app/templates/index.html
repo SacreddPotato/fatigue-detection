@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Live Fatigue Detection</title>
+    <style>
+        body { background-color: #222; color: white; text-align: center; font-family: sans-serif; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        
+        /* Control Panel */
+        .controls {
+            background: #333;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            justify-content: center;
+            align-items: center;
+        }
+        .control-group { display: flex; gap: 10px; align-items: center; border-right: 1px solid #555; padding-right: 20px; }
+        .control-group:last-child { border-right: none; }
+        
+        input[type="text"], input[type="file"] {
+            padding: 8px;
+            border-radius: 4px;
+            border: 1px solid #555;
+            background: #444;
+            color: white;
+            width: 250px;
+        }
+        button, .btn {
+            padding: 8px 15px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            text-decoration: none;
+            font-size: 14px;
+        }
+        button:hover, .btn:hover { background-color: #0056b3; }
+        .btn-secondary { background-color: #6c757d; }
+
+        /* Video Feed Styles */
+        .video-container {
+            position: relative;
+            display: inline-block;
+            width: 100%;
+            height: 80vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+        }
+        
+        .video-feed {
+            border: 5px solid #444;
+            border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            max-width: 100%;
+            max-height: 600px;
+            width: auto;
+            height: auto;
+            object-fit: contain;
+        }
+        
+        /* TRUNCATION FIX */
+        .source-tag {
+            margin-top: 10px;
+            color: #888;
+            font-size: 0.9rem;
+            max-width: 800px; /* Limits the width */
+            width: 90%;
+            white-space: nowrap; /* Forces one line */
+            overflow: hidden; /* Hides overflow */
+            text-overflow: ellipsis; /* Adds '...' */
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Live Driver Monitoring System</h1>
+
+        <!-- Control Panel -->
+        <div class="controls">
+            <div class="control-group">
+                <a href="{{ url_for('index', source='0') }}" class="btn">Use Webcam</a>
+            </div>
+            <form method="POST" class="control-group">
+                <input type="text" name="url_link" placeholder="Enter Video URL/Path" required>
+                <button type="submit">Load URL</button>
+            </form>
+            <form method="POST" enctype="multipart/form-data" class="control-group">
+                <input type="file" name="file" accept="video/*" required>
+                <button type="submit" class="btn-secondary">Upload File</button>
+            </form>
+        </div>
+
+        <!-- Video Display -->
+        <div class="video-container">
+            <img class="video-feed" src="{{ url_for('video_feed', source=source) }}">
+            <!-- Title attribute shows full URL on hover -->
+            <div class="source-tag" title="{{ source }}">Current Source: {{ source }}</div>
+        </div>
+    </div>
+</body>
+</html>
