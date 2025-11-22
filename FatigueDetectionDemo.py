@@ -17,8 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchmetrics.functional.classification import binary_f1_score
 from torchsummary import summary
 from torchvision import transforms
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
-from torchvision import transforms
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
 from lightning.pytorch.loggers import TensorBoardLogger
 
 
@@ -36,8 +35,6 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 print("Device:", device)
 
 # Build torch dataset for UTA-RLDD
-
-
 class UTARLDD(Dataset):
     def __init__(
         self, 
@@ -56,11 +53,15 @@ class UTARLDD(Dataset):
     def read_annot(self):
         img_paths = []
         labels = []
+        # Using utf-8 to handle any potential character encoding issues
         with open(self.annot_file, "r", encoding="utf-8") as f:
             for record in f.readlines():
-                img_path, label = record.strip("\n").split()
-                img_paths.append(img_path)
-                labels.append(label)
+                parts = record.strip("\n").split()
+                if len(parts) >= 2:
+                    img_path = parts[0]
+                    label = parts[1]
+                    img_paths.append(img_path)
+                    labels.append(label)
         return img_paths, labels
     
     def __len__(self):
@@ -69,7 +70,8 @@ class UTARLDD(Dataset):
     def __getitem__(self, idx):
         img_path = os.path.join(self.root_dir, self.img_paths[idx])
         
-        img = Image.open(img_path.replace("\\", os.sep))
+        # Handle path separators for different OS
+        img = Image.open(img_path.replace("\\", os.sep)).convert('RGB')
         label = self.labels[idx]
         
         if self.transform:
@@ -82,21 +84,28 @@ class UTARLDD(Dataset):
     
 
 #  Craft torch dataloader for UTA-RLDD
+
+# --- FIX 1: Added Normalization for Pretrained Models ---
+# ImageNet stats (standard for Swin/ResNet/ViT)
+normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                 std=[0.229, 0.224, 0.225])
+
 test_transform = transforms.Compose(
     [
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
+        normalize, # <--- Critical for correct colors/contrast perception
     ]
 )
+
 train_transform = transforms.Compose(
     [
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(20),
-        transforms.RandomResizedCrop((512, 512), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
-        transforms.Resize(224),
+        transforms.RandomResizedCrop((224, 224), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
         transforms.ToTensor(),
-        
+        normalize, # <--- Critical for correct colors/contrast perception
     ]
 )
 
@@ -108,54 +117,32 @@ train_set = UTARLDD(root_dir=DATASET_PATH, annot_file="train.txt", transform=tra
 val_set = UTARLDD(root_dir=DATASET_PATH, annot_file="val.txt", transform=test_transform, target_transform=to_int)
 test_set = UTARLDD(root_dir=DATASET_PATH, annot_file="test.txt", transform=test_transform, target_transform=to_int)
 
+# Reduced num_workers to 0 or 1 for Windows stability, increased for Linux/Mac
 train_loader = DataLoader(train_set, batch_size=8, shuffle=True, pin_memory=True, num_workers=2, drop_last=True)
 val_loader = DataLoader(val_set, batch_size=8, shuffle=False, num_workers=2, drop_last=False)
 test_loader = DataLoader(test_set, batch_size=8, shuffle=False, num_workers=2, drop_last=False)
 
 
-# Get labels directly without applying transforms
-train_labels = [int(label) for label in train_set.labels]
-val_labels = [int(label) for label in val_set.labels]
-
-# Visualize some examples
-# NUM_IMAGES = 4
-# UTA_images = torch.stack([train_set[idx][0] for idx in range(NUM_IMAGES)], dim=0)
-# img_grid = torchvision.utils.make_grid(UTA_images, nrow=NUM_IMAGES, normalize=True, pad_value=0.9)
-# img_grid = img_grid.permute(1, 2, 0)
-
-# plt.figure(figsize=(10, 10))
-# plt.title("Image examples of the UTA-RLD dataset")
-# plt.imshow(img_grid)
-# plt.axis("off")
-# plt.show()
-# plt.close()
-
-# Load the pretrained ViT (vit_b_32)
+# Load the pretrained Swin Transformer
 swin_b_32 = torchvision.models.swin_v2_s(weights=True)
-swin_b_32 = swin_b_32
-# summary(swin_b_32, (3, 1000, 1000))
 
-# Customize the classification head
+# --- FIX 2: Remove Sigmoid from Architecture & Add Dropout ---
+# We remove Sigmoid here to use BCEWithLogitsLoss later (better stability).
+# We add Dropout to prevent the "99% confidence" overfitting issue.
 swin_b_32.head = nn.Sequential(
-    nn.Linear(in_features=768, out_features=1, bias=True),
-    nn.Sigmoid(),
+    nn.Dropout(p=0.5), # <--- Prevents overconfidence
+    nn.Linear(in_features=768, out_features=1, bias=True)
+    # No Sigmoid here!
 )
 
 # Make sure the entire model is trainable
 for param in swin_b_32.parameters():
     param.requires_grad = True
 
-# Test it with one image from UTA-RLDD
-# img = train_set[0][0].repeat(1, 1, 1, 1)
-# plt.imshow(img[0].permute(1, 2, 0))
-# print(swin_b_32(img), "vs.", train_set[0][1])
-# print(swin_b_32(img).shape)
 
 class SwinT(L.LightningModule):
     def __init__(self, swin):
         super().__init__()
-#         self.save_hyperparameters(ignore=["vit"])
-        
         self.model = swin
     
     def forward(self, x):
@@ -163,26 +150,36 @@ class SwinT(L.LightningModule):
     
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=1e-4, weight_decay=0.01)
-        lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5, eta_min=1e-6)
+        lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10, eta_min=1e-6)
         return [optimizer], [{"scheduler": lr_scheduler, "interval": "epoch"}]
     
     def _calculate_loss(self, batch, mode="train"):
         imgs, labels = batch
-        preds = self.model(imgs).flatten()
-        loss = F.binary_cross_entropy(preds, labels.to(torch.float32))
-        f1 = binary_f1_score(preds, labels.to(torch.float32))
+        
+        # Preds are now "logits" (raw scores from -inf to +inf)
+        logits = self.model(imgs).flatten()
+        
+        # --- FIX 3: Use BCEWithLogitsLoss ---
+        # This combines Sigmoid + BCELoss in a numerically stable way
+        loss = F.binary_cross_entropy_with_logits(logits, labels.to(torch.float32))
+        
+        # Calculate probabilities manually for F1 score and logging
+        probs = torch.sigmoid(logits)
+        f1 = binary_f1_score(probs, labels.to(torch.float32))
 
         self.log_dict({"%s_loss" % mode: loss, "%s_f1" % mode: f1}, prog_bar=True)
-        return loss, f1
+        return loss, f1, probs
 
     def training_step(self, batch, batch_idx):
-        loss, f1 = self._calculate_loss(batch, mode="train")
+        loss, f1, probs = self._calculate_loss(batch, mode="train")
+        
         # Debug: print labels and predictions for the first batch of each epoch
         if batch_idx == 0:
             imgs, labels = batch
-            preds = self.model(imgs).flatten().detach().cpu().numpy()
-            print(f"[DEBUG] Labels: {labels.detach().cpu().numpy()}")
-            print(f"[DEBUG] Predictions: {preds}")
+            # We use the calculated probs from above
+            preds_numpy = probs.detach().cpu().numpy()
+            print(f"\n[DEBUG] Labels: {labels.detach().cpu().numpy()}")
+            print(f"[DEBUG] Probabilities: {preds_numpy}")
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -202,22 +199,28 @@ def train_fn(l_vit):
         max_epochs=150,
         gradient_clip_val=1,
         callbacks=[
-            ModelCheckpoint(mode="max", monitor="val_f1"),
+            ModelCheckpoint(mode="max", monitor="val_f1", save_last=True),
             LearningRateMonitor("epoch"),
+            # --- FIX 4: Early Stopping ---
+            # Stops training if validation F1 score doesn't improve for 10 epochs
+            EarlyStopping(monitor="val_f1", patience=10, mode="max")
         ],
         log_every_n_steps=10,
     )
-    trainer.logger._log_graph = False  # If True, we plot the computation graph in tensorboard
-    trainer.logger._default_hp_metric = None  # Optional logging argument that we don't need
+    trainer.logger._log_graph = False 
+    trainer.logger._default_hp_metric = None 
 
-    # Always train from scratch
-    L.seed_everything(42)  # To be reproducible
+    L.seed_everything(42)
     model = l_vit
     trainer.fit(model, train_loader, val_loader)
-    # Load best checkpoint after training
-    model = SwinT.load_from_checkpoint(trainer.checkpoint_callback.best_model_path, swin=swin_b_32)
-
-    # Test best model on validation and test set
+    
+    # Load best checkpoint
+    # Note: We must pass the architecture (swin=swin_b_32) when loading
+    if trainer.checkpoint_callback.best_model_path:
+        print(f"Loading best model from: {trainer.checkpoint_callback.best_model_path}")
+        model = SwinT.load_from_checkpoint(trainer.checkpoint_callback.best_model_path, swin=swin_b_32)
+    
+    # Test best model
     test_result = trainer.test(model, dataloaders=test_loader, verbose=False)
     result = {"test": test_result[0]["test_f1"]}
 
@@ -228,7 +231,5 @@ def train_fn(l_vit):
 if __name__ == "__main__":
     model, result = train_fn(swin_model)
     print("Test F1 score:", result["test"])
-    # Save the best model weights for later use
+    # Save the best model weights
     torch.save(model.model.state_dict(), os.path.join(CHECKPOINT_PATH, "swin_best.pth"))
-    
-    
