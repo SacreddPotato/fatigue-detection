@@ -14,40 +14,74 @@ app = Flask(__name__)
 MODEL_PATH = "swin_best.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- 1. Preprocessing (Single Definition) ---
-# Ensure this matches the training exactly (Normalization included)
+# --- 1. Preprocessing ---
 transform = transforms.Compose([
     transforms.Resize(256),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
-    # Vital: This matches ImageNet statistics used in training
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) 
 ])
 
-# --- 2. Model Setup (Single Definition) ---
-def get_model():
+# --- 2. Robust Model Loader ---
+def load_model_safe(path, device):
+    print(f"Attempting to load model from {path}...")
+    
+    if not os.path.exists(path):
+        print("WARNING: Model file not found. Predictions will be random.")
+        # Return a random initialized model just so app doesn't crash
+        model = torchvision.models.swin_v2_s(weights=None)
+        model.head = nn.Sequential(nn.Linear(768, 1))
+        return model.to(device)
+
+    # Attempt 1: Try New Architecture (Dropout -> Linear)
+    # This is what you will have AFTER you retrain
     model = torchvision.models.swin_v2_s(weights=None)
     model.head = nn.Sequential(
-        nn.Dropout(p=0.5),  # Kept to match the state_dict keys
-        nn.Linear(in_features=768, out_features=1, bias=True),
-        # nn.Sigmoid() removed here because we use BCEWithLogitsLoss in training
+        nn.Dropout(p=0.5),
+        nn.Linear(in_features=768, out_features=1, bias=True)
     )
-    return model
+    
+    try:
+        state_dict = torch.load(path, map_location=device)
+        model.load_state_dict(state_dict)
+        model.to(device)
+        model.eval()
+        print("SUCCESS: Loaded New Model Architecture (Dropout Enabled).")
+        return model
+    except RuntimeError:
+        print("Warning: New architecture match failed. Trying old architecture...")
+
+    # Attempt 2: Try Old Architecture (Linear -> Sigmoid)
+    # This is what you have NOW
+    model = torchvision.models.swin_v2_s(weights=None)
+    model.head = nn.Sequential(
+        nn.Linear(in_features=768, out_features=1, bias=True),
+        nn.Sigmoid()
+    )
+    
+    try:
+        state_dict = torch.load(path, map_location=device)
+        model.load_state_dict(state_dict)
+        
+        # CRITICAL FIX:
+        # The old model outputs Probabilities (0-1) because of Sigmoid.
+        # The new model outputs Logits (-inf to +inf).
+        # Your inference code expects Logits (because it calls torch.sigmoid).
+        # So, we remove the Sigmoid layer from this old model after loading weights.
+        model.head = nn.Sequential(
+            model.head[0] # Keep only the Linear layer
+        )
+        
+        model.to(device)
+        model.eval()
+        print("SUCCESS: Loaded Old Model Architecture (Fixed for compatibility).")
+        return model
+    except Exception as e:
+        print(f"FATAL ERROR: Could not load model. {e}")
+        return None
 
 # --- Load Model ---
-print(f"Loading model from {MODEL_PATH}...")
-model = get_model()
-
-if os.path.exists(MODEL_PATH):
-    # map_location ensures it loads on CPU if CUDA is not available
-    state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
-    model.load_state_dict(state_dict)
-    print("Model loaded successfully.")
-else:
-    print("WARNING: Model file not found. Predictions will be random.")
-
-model.to(DEVICE)
-model.eval()
+model = load_model_safe(MODEL_PATH, DEVICE)
 
 # --- Routes ---
 @app.route('/', methods=['GET', 'POST'])
@@ -57,7 +91,6 @@ def index():
     image_data = None
 
     if request.method == 'POST':
-        # 1. Validation: Check if file was uploaded
         if 'file' not in request.files:
             return render_template('index.html', error="No file uploaded.")
         
@@ -68,30 +101,30 @@ def index():
 
         if file:
             try:
-                # 2. Open the image
+                # 1. Open the image
                 img = Image.open(file.stream).convert('RGB')
                 
-                # 3. Convert to Base64 for display (Optional but nice for UI)
+                # 2. Convert to Base64 for display
                 buffered = BytesIO()
                 img.save(buffered, format="JPEG")
                 img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
                 image_data = f"data:image/jpeg;base64,{img_str}"
                 
-                # 4. Transform image for model
+                # 3. Transform image
                 img_tensor = transform(img).unsqueeze(0).to(DEVICE)
                 
-                # 5. Run Inference
+                # 4. Run Inference
                 with torch.no_grad():
                     output = model(img_tensor)
                     
-                    # Apply Sigmoid here because we removed it from the model
+                    # Always apply sigmoid now, because load_model_safe ensures 
+                    # we output logits regardless of which model file is used.
                     prob = torch.sigmoid(output).flatten().item() 
                     
                     pred_class = int(prob > 0.5)
                 
-                # 6. Decode Result
+                # 5. Decode Result
                 label = "Fatigue Detected" if pred_class == 1 else "Active / Alert"
-                # Confidence calculation: if prob is 0.1 (Active), confidence is 0.9 (90% sure it's Active)
                 confidence = prob if pred_class == 1 else 1 - prob
                 
                 prediction_result = {
@@ -103,7 +136,6 @@ def index():
             except Exception as e:
                 error_msg = f"Error processing image: {str(e)}"
 
-    # Return template with all variables
     return render_template('index.html', result=prediction_result, image_data=image_data, error=error_msg)
 
 if __name__ == '__main__':
