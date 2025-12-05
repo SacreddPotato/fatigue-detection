@@ -1,27 +1,38 @@
 import torch
-import torchvision
-import torch.nn as nn
-from FatigueDetectionDemo import SwinT
+import os
+# Import your model definition from the training file
+from FatigueDetectionDemo import SwinT, swin_b_32
 
-# Path to your checkpoint
-ckpt_path = "saved_models/SwinTrans/Siwn/lightning_logs/version_3/checkpoints/epoch=1-step=1596.ckpt"
-# Path to save the recovered weights
-save_path = "saved_models/SwinTrans/swin_best.pth"
+# --- CONFIGURATION ---
+# REPLACE THIS with the actual path to your .ckpt file
+CKPT_PATH = "saved_models/SwinTrans/Swin/lightning_logs/version_3/checkpoints/last.ckpt" 
+OUTPUT_PATH = "saved_models/SwinTrans/swin_best.pth"
 
-# 1. Instantiate your Swin backbone
-swin_b_32 = torchvision.models.swin_v2_s(weights=True)
-swin_b_32.head = nn.Sequential(
-    nn.Linear(in_features=768, out_features=1, bias=True),
-    nn.Sigmoid(),
-)
+if not os.path.exists(CKPT_PATH):
+    # Try to find it automatically if user didn't set it
+    print(f"File not found: {CKPT_PATH}")
+    print("Please edit CKPT_PATH in this script to point to your .ckpt file.")
+    exit()
 
-# 2. Create your LightningModule
-model = SwinT(swin=swin_b_32)
+print(f"Loading checkpoint from {CKPT_PATH}...")
+# Load the lightning checkpoint
+checkpoint = torch.load(CKPT_PATH, map_location="cpu")
 
-# 3. Load the checkpoint
-checkpoint = torch.load(ckpt_path, map_location="cpu")
-model.load_state_dict(checkpoint["state_dict"])
+# Extract the state_dict
+state_dict = checkpoint["state_dict"]
 
-# 4. Save the model weights
-torch.save(model.model.state_dict(), save_path)
-print(f"Recovered model weights saved to {save_path}")
+# Create a new dictionary for the standard PyTorch model
+# Lightning adds "model." prefix to keys, we might need to remove it if your app expects pure Swin keys
+# But your SwinT class wrapped it as self.model, so keys are likely "model.features..."
+# Let's just save the model.model part to be safe for your app.
+
+print("Extracting weights...")
+# Re-instantiate the Lightning Module to load weights correctly
+model = SwinT(swin_b_32)
+model.load_state_dict(state_dict)
+
+# Save the inner model weights (which your app expects)
+torch.save(model.model.state_dict(), OUTPUT_PATH)
+
+print(f"Success! Saved recovered weights to {OUTPUT_PATH}")
+print("You can now run your app.")
