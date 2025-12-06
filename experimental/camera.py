@@ -1,271 +1,192 @@
 import cv2
+import dlib
 import torch
-import torchvision
-import torch.nn as nn
+import numpy as np
+import os
+from imutils import face_utils
+from scipy.spatial import distance as dist
 from torchvision import transforms
 from PIL import Image
-import numpy as np
 from collections import deque
-import time
-import os
-from scipy.spatial import distance as dist
+import torchvision.models as models
+import torch.nn as nn
 
-# --- DLIB IMPORT ---
-try:
-    import dlib
-    DLIB_AVAILABLE = True
-except ImportError:
-    print("WARNING: Dlib not found. Please activate your 'fatigue_env' environment.")
-    DLIB_AVAILABLE = False
+# --- CONFIGURATION ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PREDICTOR_PATH = os.path.join(BASE_DIR, "shape_predictor_68_face_landmarks.dat")
+MODEL_PATH = os.path.join(BASE_DIR, "swin_best.pth")
+
+# --- 3D MODEL POINTS ---
+MODEL_POINTS_3D = np.array([
+    (0.0, 0.0, 0.0), (0.0, -330.0, -65.0), (-225.0, 170.0, -135.0),
+    (225.0, 170.0, -135.0), (-150.0, -150.0, -125.0), (150.0, -150.0, -125.0)
+], dtype=np.float64)
+
+# --- HELPER FUNCTIONS ---
+def get_head_pose(shape, img_h, img_w):
+    image_points = np.array([
+        shape[30], shape[8], shape[36], shape[45], shape[48], shape[54]
+    ], dtype="double")
+    focal_length = img_w
+    center = (img_w / 2, img_h / 2)
+    camera_matrix = np.array([[focal_length, 0, center[0]], [0, focal_length, center[1]], [0, 0, 1]], dtype="double")
+    dist_coeffs = np.zeros((4, 1))
+    (success, rotation_vector, translation_vector) = cv2.solvePnP(
+        MODEL_POINTS_3D, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
+    rmat, jac = cv2.Rodrigues(rotation_vector)
+    angles, mtxR, mtxQ, Qx, Qy, Qz = cv2.RQDecomp3x3(rmat)
+    return angles[0], angles[1], angles[2], (int(image_points[0][0]), int(image_points[0][1]))
+
+def mouth_aspect_ratio(mouth):
+    A = dist.euclidean(mouth[1], mouth[7])
+    B = dist.euclidean(mouth[2], mouth[6])
+    C = dist.euclidean(mouth[3], mouth[5])
+    D = dist.euclidean(mouth[0], mouth[4])
+    if D == 0: return 0
+    return (A + B + C) / (3.0 * D)
+
+def eye_aspect_ratio(eye):
+    A = dist.euclidean(eye[1], eye[5])
+    B = dist.euclidean(eye[2], eye[4])
+    C = dist.euclidean(eye[0], eye[3])
+    if C == 0: return 0
+    return (A + B) / (2.0 * C)
 
 class VideoCamera(object):
-    def __init__(self, model_path='swin_best.pth', predictor_path='shape_predictor_68_face_landmarks.dat', source=0):
+    def __init__(self, source=0):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = self.load_model_safe(model_path)
-        self.transform = transforms.Compose([
-        transforms.Resize((224, 224)), # Force exact squeeze, NO CROP
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+        self.model = models.swin_v2_s(weights=None)
+        self.model.head = nn.Sequential(
+            nn.Dropout(p=0.5), nn.Linear(in_features=768, out_features=1, bias=True))
+        
+        if os.path.exists(MODEL_PATH):
+            try:
+                self.model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device), strict=False)
+                print(f"[INFO] Model loaded from {MODEL_PATH}")
+            except Exception as e: print(f"[ERROR] Failed to load model: {e}")
+        else:
+            parent_path = os.path.join(BASE_DIR, "../saved_models/SwinTrans/swin_best.pth")
+            if os.path.exists(parent_path):
+                self.model.load_state_dict(torch.load(parent_path, map_location=self.device), strict=False)
+                print(f"[INFO] Found model in parent directory")
+            else: print(f"[WARNING] Model not found. Using random weights!")
+            
+        self.model.to(self.device)
+        self.model.eval()
 
-        self.dlib_ready = False
-        if DLIB_AVAILABLE and os.path.exists(predictor_path):
-            self.detector = dlib.get_frontal_face_detector()
-            self.predictor = dlib.shape_predictor(predictor_path)
-            self.dlib_ready = True
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)), transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+
+        self.detector = dlib.get_frontal_face_detector()
+        try: self.predictor = dlib.shape_predictor(PREDICTOR_PATH)
+        except: 
+            parent_pred = os.path.join(BASE_DIR, "../shape_predictor_68_face_landmarks.dat")
+            if os.path.exists(parent_pred): self.predictor = dlib.shape_predictor(parent_pred)
+            else: print("CRITICAL: Shape predictor not found!")
+
+        self.is_calibrating, self.calibration_frames, self.calibration_limit = True, 0, 45
+        self.ear_readings, self.mar_readings, self.pitch_readings, self.roll_readings = [], [], [], []
+        
+        # Resting EAR baseline
+        self.RESTING_EAR = 0.30 
+        self.EYE_AR_THRESH, self.MOUTH_AR_THRESH, self.RESTING_PITCH, self.RESTING_ROLL, self.HEAD_THRESH = 0.25, 0.60, 0.0, 0.0, 15.0
         
         self.prediction_buffer = deque(maxlen=30)
-        self.EYE_AR_THRESH = 0.25
-        self.MAR_THRESH = 0.6 
-
-        self.source = source
+        (self.lStart, self.lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
+        (self.rStart, self.rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
+        self.mStart, self.mEnd = (60, 68)
         self.video = cv2.VideoCapture(source)
-        self.valid_source = self.video.isOpened()
 
-        self.frame_count = 0
-        self.PROCESS_EVERY_N_FRAMES = 3 
-        self.last_results = []           
-
-    def __del__(self):
-        if self.video.isOpened(): self.video.release()
-
-    def load_model_safe(self, path):
-        model = torchvision.models.swin_v2_s(weights=None)
-        model.head = nn.Sequential(nn.Dropout(0.5), nn.Linear(768, 1))
-        try:
-            state_dict = torch.load(path, map_location=self.device)
-            model.load_state_dict(state_dict)
-            model.to(self.device).eval()
-            return model
-        except:
-            model = torchvision.models.swin_v2_s(weights=None)
-            model.head = nn.Sequential(nn.Linear(768, 1), nn.Sigmoid())
-            try:
-                state_dict = torch.load(path, map_location=self.device)
-                model.load_state_dict(state_dict)
-                model.to(self.device).eval()
-                return model
-            except: return model
-
-    def eye_aspect_ratio(self, eye):
-        A = dist.euclidean(eye[1], eye[5])
-        B = dist.euclidean(eye[2], eye[4])
-        C = dist.euclidean(eye[0], eye[3])
-        return (A + B) / (2.0 * C)
-
-    def mouth_aspect_ratio(self, mouth):
-        A = dist.euclidean(mouth[2], mouth[10]) 
-        B = dist.euclidean(mouth[4], mouth[8])
-        C = dist.euclidean(mouth[0], mouth[6]) 
-        return (A + B) / (2.0 * C)
-
-    def create_error_frame(self, msg):
-        img = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(img, msg, (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        ret, jpeg = cv2.imencode('.jpg', img)
-        return jpeg.tobytes()
-
-    def draw_dashboard(self, frame, metrics):
-        """Draws a breakdown of the calculation on the screen."""
-        overlay = frame.copy()
-        
-        # Dashboard dimensions
-        box_h = 180
-        box_w = 300
-        padding = 10
-        
-        # Draw semi-transparent background
-        cv2.rectangle(overlay, (padding, padding), (padding + box_w, padding + box_h), (0, 0, 0), -1)
-        alpha = 0.6
-        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-        
-        # Font settings
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.5
-        white = (255, 255, 255)
-        green = (0, 255, 0)
-        red = (0, 0, 255)
-        yellow = (0, 255, 255)
-        
-        # 1. Swin Score (50%)
-        swin_val = metrics['swin']
-        swin_color = red if swin_val > 0.5 else green
-        cv2.putText(frame, f"Swin Model (50%):  {swin_val:.2f}", (20, 40), font, scale, white, 1)
-        # Visual Bar
-        cv2.rectangle(frame, (180, 30), (180 + int(swin_val * 100), 40), swin_color, -1)
-
-        # 2. EAR Score (30%)
-        if self.dlib_ready:
-            ear_prob = metrics['ear_prob'] # The calculated probability (0-1), not raw EAR
-            ear_color = red if ear_prob > 0.5 else green
-            cv2.putText(frame, f"Eyes/EAR (30%):    {ear_prob:.2f}", (20, 70), font, scale, white, 1)
-            cv2.rectangle(frame, (180, 60), (180 + int(ear_prob * 100), 70), ear_color, -1)
-            # Show raw value small
-            cv2.putText(frame, f"(Raw: {metrics['ear_val']:.2f})", (20, 85), font, 0.4, (200,200,200), 1)
-
-            # 3. MAR Score (20%)
-            mar_prob = metrics['mar_prob']
-            mar_color = red if mar_prob > 0.5 else green
-            cv2.putText(frame, f"Mouth/MAR (20%):   {mar_prob:.2f}", (20, 110), font, scale, white, 1)
-            cv2.rectangle(frame, (180, 100), (180 + int(mar_prob * 100), 110), mar_color, -1)
-            cv2.putText(frame, f"(Raw: {metrics['mar_val']:.2f})", (20, 125), font, 0.4, (200,200,200), 1)
-        else:
-            cv2.putText(frame, "Geometry: N/A", (20, 70), font, scale, (100,100,100), 1)
-
-        # 4. Final Sum
-        final = metrics['score']
-        status = "FATIGUE" if final > 0.5 else "ACTIVE"
-        status_color = red if final > 0.5 else green
-        
-        cv2.line(frame, (20, 140), (280, 140), white, 1)
-        cv2.putText(frame, f"TOTAL: {final:.2f} [{status}]", (20, 165), font, 0.6, status_color, 2)
+    def __del__(self): self.video.release()
 
     def get_frame(self):
-        if not self.valid_source:
-            time.sleep(0.5)
-            return self.create_error_frame(f"Cannot Open: {self.source}")
-
         success, frame = self.video.read()
-        if not success:
-            time.sleep(0.5)
-            return self.create_error_frame("Stream Ended")
-
-        self.frame_count += 1
-
-        if self.frame_count % self.PROCESS_EVERY_N_FRAMES == 0:
-            height, width = frame.shape[:2]
-            target_width = 400
-            ratio = target_width / float(width)
-            new_height = int(height * ratio)
-            frame_small = cv2.resize(frame, (target_width, new_height))
-            gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
+        if not success: return None
+        frame = cv2.resize(frame, (800, 600))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        img_h, img_w = frame.shape[:2]
+        rects = self.detector(gray, 0)
+        status, color = "Scanning...", (0, 255, 0)
+        
+        if len(rects) > 0:
+            rect = rects[0]
+            shape = self.predictor(gray, rect)
+            shape = face_utils.shape_to_np(shape)
             
-            current_results = []
-            rects = []
+            leftEAR = eye_aspect_ratio(shape[self.lStart:self.lEnd])
+            rightEAR = eye_aspect_ratio(shape[self.rStart:self.rEnd])
+            ear = (leftEAR + rightEAR) / 2.0
+            mar = mouth_aspect_ratio(shape[self.mStart:self.mEnd])
+            pitch, yaw, roll, nose_point = get_head_pose(shape, img_h, img_w)
 
-            if self.dlib_ready:
-                rects = self.detector(gray, 0)
-                if len(rects) > 0:
-                    rects = [max(rects, key=lambda r: r.area())]
-            
-            # Default metrics if no face found
-            if not rects:
-                 self.last_results = [{
-                    "box": None,
-                    "swin": 0.0, "ear_val": 0.0, "ear_prob": 0.0, 
-                    "mar_val": 0.0, "mar_prob": 0.0, "score": 0.0,
-                    "landmarks": [], "ratio": ratio
-                }]
-
-            for rect in rects:
-                x, y, w, h = rect.left(), rect.top(), rect.width(), rect.height()
-                x_orig = int(x / ratio); y_orig = int(y / ratio)
-                w_orig = int(w / ratio); h_orig = int(h / ratio)
-                x_orig = max(0, x_orig); y_orig = max(0, y_orig)
-                w_orig = min(w_orig, width - x_orig); h_orig = min(h_orig, height - y_orig)
-
-                # --- SWIN ---
-                try:
-                    face_img = frame[y_orig:y_orig+h_orig, x_orig:x_orig+w_orig]
-                    rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-                    pil = Image.fromarray(rgb)
-                    inp = self.transform(pil).unsqueeze(0).to(self.device)
-                    with torch.no_grad():
-                        prob = torch.sigmoid(self.model(inp)).flatten().item()
-                except: prob = 0.0
-
-                # --- GEOMETRY ---
-                ear_prob, mar_prob = 0.0, 0.0
-                raw_ear, raw_mar = 0.0, 0.0
-                landmarks_to_draw = []
-
-                if self.dlib_ready:
-                    shape = self.predictor(gray, rect)
-                    shape_np = np.zeros((68, 2), dtype="int")
-                    for i in range(0, 68):
-                        shape_np[i] = (shape.part(i).x, shape.part(i).y)
-
-                    leftEye = shape_np[36:42]
-                    rightEye = shape_np[42:48]
-                    mouth = shape_np[48:68]
-
-                    leftEAR = self.eye_aspect_ratio(leftEye)
-                    rightEAR = self.eye_aspect_ratio(rightEye)
-                    raw_ear = (leftEAR + rightEAR) / 2.0
-                    raw_mar = self.mouth_aspect_ratio(mouth)
-
-                    # Logic: Convert to Fatigue Probability
-                    # EAR: Normal is ~0.35. Drowsy is < 0.25.
-                    if raw_ear < self.EYE_AR_THRESH: ear_prob = 1.0 
-                    else: ear_prob = max(0, (0.35 - raw_ear) / 0.1)
-
-                    # MAR: Normal is < 0.3. Yawn is > 0.6.
-                    if raw_mar > self.MAR_THRESH: mar_prob = 1.0
-                    else: mar_prob = max(0, (raw_mar - 0.3) / 0.3)
+            if self.is_calibrating:
+                self.ear_readings.append(ear); self.mar_readings.append(mar); self.pitch_readings.append(pitch); self.roll_readings.append(roll)
+                self.calibration_frames += 1
+                cv2.putText(frame, f"CALIBRATING... {self.calibration_frames}/{self.calibration_limit}", (50, 300), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                cv2.rectangle(frame, (rect.left(), rect.top()), (rect.right(), rect.bottom()), (0, 255, 255), 2)
+                if self.calibration_frames >= self.calibration_limit:
+                    self.is_calibrating = False
                     
-                    landmarks_to_draw = [leftEye, rightEye, mouth]
-
-                # --- FUSION FORMULA ---
-                consensus = (prob * 0.50) + (ear_prob * 0.30) + (mar_prob * 0.20)
+                    self.RESTING_EAR = sum(self.ear_readings)/len(self.ear_readings)
+                    
+                    self.EYE_AR_THRESH = self.RESTING_EAR * 0.80
+                    self.MOUTH_AR_THRESH = (sum(self.mar_readings)/len(self.mar_readings)) + 0.15
+                    self.RESTING_PITCH = sum(self.pitch_readings)/len(self.pitch_readings)
+                    self.RESTING_ROLL = sum(self.roll_readings)/len(self.roll_readings)
+                    print(f"[CALIBRATION DONE] Resting EAR: {self.RESTING_EAR:.3f}, Threshold: {self.EYE_AR_THRESH:.3f}")
+            else:
+                (x, y, w, h) = face_utils.rect_to_bb(rect)
+                pad = 10
+                face_img = frame[max(0, y-pad):min(img_h, y+h+pad), max(0, x-pad):min(img_w, x+w+pad)]
+                if face_img.size > 0:
+                    pil_img = Image.fromarray(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
+                    input_tensor = self.transform(pil_img).unsqueeze(0).to(self.device)
+                    with torch.no_grad():
+                        output = self.model(input_tensor)
+                        self.prediction_buffer.append(torch.sigmoid(output).item())
                 
-                self.prediction_buffer.append(consensus)
-                avg = sum(self.prediction_buffer) / len(self.prediction_buffer)
+                avg_prob = sum(self.prediction_buffer)/len(self.prediction_buffer) if self.prediction_buffer else 0.5
+                pitch_diff, roll_diff = abs(pitch - self.RESTING_PITCH), abs(roll - self.RESTING_ROLL)
+                head_score = 1.0 if (pitch_diff > self.HEAD_THRESH or roll_diff > self.HEAD_THRESH) else 0.0
+
+                # --- FIX: Calculate Droop Score BEFORE decision logic ---
+                # So it is available for display even if Eyes Closed trigger fires
+                droop_denom = (self.RESTING_EAR - self.EYE_AR_THRESH)
+                # Avoid division by zero if resting ear is somehow same as thresh
+                if droop_denom == 0: droop_denom = 0.001
                 
-                status = "FATIGUE" if avg > 0.5 else "Safe"
-                color = (0, 0, 255) if avg > 0.5 else (0, 255, 0)
+                droop_score = (self.RESTING_EAR - ear) / droop_denom
+                droop_score = max(0.0, min(droop_score, 1.0))
 
-                current_results.append({
-                    "box": (x_orig, y_orig, w_orig, h_orig),
-                    "status": status, "score": avg, "color": color,
-                    "swin": prob, 
-                    "ear_val": raw_ear, "ear_prob": ear_prob,
-                    "mar_val": raw_mar, "mar_prob": mar_prob,
-                    "landmarks": landmarks_to_draw, "ratio": ratio
-                })
+                if ear < self.EYE_AR_THRESH:
+                    score, reason = 1.0, "EYES CLOSED"
+                    droop_score = 1.0 # Force max droop for display
+                elif head_score > 0.5:
+                    score, reason = 1.0, "HEAD NOD/TILT"
+                else:
+                    # Formula: AI(60%) + Droop(20%) + Yawn(20%)
+                    mar_score = 1.0 if mar > self.MOUTH_AR_THRESH else 0.0
+                    score = (avg_prob * 0.6) + (droop_score * 0.2) + (mar_score * 0.2)
+                    reason = "FATIGUE" if score > 0.5 else "Active"
 
-            self.last_results = current_results
+                if score > 0.5: status, color = f"WARNING: {reason}", (0, 0, 255)
+                else: status, color = "Active", (0, 255, 0)
 
-        # --- DRAWING ---
-        for res in self.last_results:
-            self.draw_dashboard(frame, res)
-            
-            if res["box"] is not None:
-                x, y, w, h = res["box"]
-                color = res["color"]
-                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 3)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                cv2.putText(frame, f"AI: {avg_prob:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
                 
-                if self.dlib_ready:
-                    ratio = res["ratio"]
-                    for feat in res["landmarks"]:
-                        for (lx, ly) in feat:
-                            rx, ry = int(lx / ratio), int(ly / ratio)
-                            cv2.circle(frame, (rx, ry), 2, (0, 255, 255), -1)
+                # Now this variable is guaranteed to exist
+                cv2.putText(frame, f"Droop: {droop_score:.2f} (EAR: {ear:.2f})", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+                
+                cv2.putText(frame, f"MAR: {mar:.2f}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+                cv2.putText(frame, f"Score: {score:.2f}", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                
+                p2 = (int(nose_point[0] + yaw * 2), int(nose_point[1] - pitch * 2))
+                cv2.line(frame, nose_point, p2, (0, 255, 255), 2)
 
-        # Resize for browser
-        h, w = frame.shape[:2]
-        if w > 800:
-            scale = 800 / w
-            frame = cv2.resize(frame, (800, int(h * scale)))
+            for (x, y) in shape: cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
 
         ret, jpeg = cv2.imencode('.jpg', frame)
         return jpeg.tobytes()

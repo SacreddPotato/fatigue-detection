@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Hybrid Fatigue System</title>
+    <style>
+        body { background: #1a1a1a; color: #eee; font-family: sans-serif; text-align: center; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .video-box { 
+            border: 2px solid #555; 
+            border-radius: 8px; 
+            max-width: 100%; 
+            height: auto; 
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+        .controls { background: #333; padding: 15px; margin-bottom: 20px; border-radius: 8px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;}
+        input { padding: 8px; background: #222; border: 1px solid #555; color: white; border-radius: 4px; }
+        button { padding: 8px 15px; background: #007bff; color: white; border: none; cursor: pointer; border-radius: 4px; }
+        button:hover { background: #0056b3; }
+        .info-panel { text-align: left; background: #222; padding: 15px; margin-top: 20px; border-radius: 8px; font-size: 0.9em; color: #aaa; border: 1px solid #333;}
+        .highlight { color: #00bcd4; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hybrid Fatigue Detection <span class="highlight">(Swin + Geometry)</span></h1>
+        
+        <div class="controls">
+            <a href="{{ url_for('index', source='0') }}"><button>Use Webcam</button></a>
+            
+            <form method="POST" style="display:inline;">
+                <input type="text" name="url_link" placeholder="Video URL or Path" required>
+                <button>Load URL</button>
+            </form>
+            
+            <form method="POST" enctype="multipart/form-data" style="display:inline;">
+                <input type="file" name="file" accept="video/*" required>
+                <button>Upload File</button>
+            </form>
+        </div>
+
+        <img class="video-box" src="{{ url_for('video_feed', source=source) }}">
+
+        <div class="info-panel">
+            <h3>Live Dashboard Guide:</h3>
+            <ul>
+                <li><strong>Critical Triggers (Immediate Alert):</strong>
+                    <ul>
+                        <li><span style="color: #ff4444">EAR (Eyes):</span> If eyes physically close, Score = 1.0.</li>
+                        <li><span style="color: #ff4444">Head Pose:</span> If head nods or tilts > 15°, Score = 1.0.</li>
+                    </ul>
+                </li>
+                <li><strong>Weighted Analysis (Score Calculation):</strong>
+                    <ul>
+                        <li><span style="color: #00bcd4">AI Model (60%):</span> Visual analysis of fatigue features.</li>
+                        <li><span style="color: #00bcd4">Eye Droop (20%):</span> How closed are the eyes relative to resting state?</li>
+                        <li><span style="color: #00bcd4">Yawn (20%):</span> Is the mouth wide open?</li>
+                    </ul>
+                </li>
+                <li><strong>Final Consensus:</strong> If the calculated score is > 0.50, Fatigue is confirmed.</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
