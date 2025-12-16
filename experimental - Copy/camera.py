@@ -16,15 +16,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PREDICTOR_PATH = os.path.join(BASE_DIR, "shape_predictor_68_face_landmarks.dat")
 MODEL_PATH = os.path.join(BASE_DIR, "swin_best.pth")
 
-# --- 3D MODEL POINTS (using 6 stable landmarks) ---
-# Nose tip, Chin, Left eye corner, Right eye corner, Left mouth corner, Right mouth corner
+# --- 3D MODEL POINTS ---
 MODEL_POINTS_3D = np.array([
-    (0.0, 0.0, 0.0),             # Nose tip (30)
-    (0.0, -63.6, -12.5),         # Chin (8) - scaled down for better accuracy
-    (-43.3, 32.7, -26.0),        # Left eye left corner (36)
-    (43.3, 32.7, -26.0),         # Right eye right corner (45)
-    (-28.9, -28.9, -24.1),       # Left mouth corner (48)
-    (28.9, -28.9, -24.1)         # Right mouth corner (54)
+    (0.0, 0.0, 0.0), (0.0, -330.0, -65.0), (-225.0, 170.0, -135.0),
+    (225.0, 170.0, -135.0), (-150.0, -150.0, -125.0), (150.0, -150.0, -125.0)
 ], dtype=np.float64)
 
 # --- HELPER FUNCTIONS ---
@@ -32,32 +27,15 @@ def get_head_pose(shape, img_h, img_w):
     image_points = np.array([
         shape[30], shape[8], shape[36], shape[45], shape[48], shape[54]
     ], dtype="double")
-    
-    # Better focal length estimation (typical webcam FOV ~60 degrees)
-    focal_length = img_w / (2 * np.tan(np.radians(30)))
+    focal_length = img_w
     center = (img_w / 2, img_h / 2)
-    camera_matrix = np.array([
-        [focal_length, 0, center[0]], 
-        [0, focal_length, center[1]], 
-        [0, 0, 1]
-    ], dtype="double")
+    camera_matrix = np.array([[focal_length, 0, center[0]], [0, focal_length, center[1]], [0, 0, 1]], dtype="double")
     dist_coeffs = np.zeros((4, 1))
-    
     (success, rotation_vector, translation_vector) = cv2.solvePnP(
         MODEL_POINTS_3D, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
-    
-    if not success:
-        return 0, 0, 0, (int(image_points[0][0]), int(image_points[0][1]))
-    
-    rmat, _ = cv2.Rodrigues(rotation_vector)
-    angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
-    
-    # Clamp angles to reasonable range (-45 to 45 degrees for normal head movement)
-    pitch = np.clip(angles[0], -45, 45)
-    yaw = np.clip(angles[1], -45, 45)
-    roll = np.clip(angles[2], -45, 45)
-    
-    return pitch, yaw, roll, (int(image_points[0][0]), int(image_points[0][1]))
+    rmat, jac = cv2.Rodrigues(rotation_vector)
+    angles, mtxR, mtxQ, Qx, Qy, Qz = cv2.RQDecomp3x3(rmat)
+    return angles[0], angles[1], angles[2], (int(image_points[0][0]), int(image_points[0][1]))
 
 def mouth_aspect_ratio(mouth):
     A = dist.euclidean(mouth[1], mouth[7])
@@ -114,10 +92,6 @@ class VideoCamera(object):
         self.RESTING_EAR = 0.30 
         self.EYE_AR_THRESH, self.MOUTH_AR_THRESH, self.RESTING_PITCH, self.RESTING_ROLL, self.HEAD_THRESH = 0.25, 0.60, 0.0, 0.0, 15.0
         
-        # Smoothing buffers for head pose (reduces noise/spikes)
-        self.pitch_buffer = deque(maxlen=5)
-        self.roll_buffer = deque(maxlen=5)
-        
         self.prediction_buffer = deque(maxlen=30)
         (self.lStart, self.lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
         (self.rStart, self.rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
@@ -129,6 +103,7 @@ class VideoCamera(object):
     def get_frame(self):
         success, frame = self.video.read()
         if not success: return None
+        frame = cv2.resize(frame, (800, 600))
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         img_h, img_w = frame.shape[:2]
         rects = self.detector(gray, 0)
@@ -172,17 +147,7 @@ class VideoCamera(object):
                         self.prediction_buffer.append(torch.sigmoid(output).item())
                 
                 avg_prob = sum(self.prediction_buffer)/len(self.prediction_buffer) if self.prediction_buffer else 0.5
-                
-                # Apply smoothing to head pose using median filter
-                self.pitch_buffer.append(pitch)
-                self.roll_buffer.append(roll)
-                smoothed_pitch = np.median(list(self.pitch_buffer))
-                smoothed_roll = np.median(list(self.roll_buffer))
-                
-                pitch_diff = abs(smoothed_pitch - self.RESTING_PITCH)
-                roll_diff = abs(smoothed_roll - self.RESTING_ROLL)
-                
-                # Head pose is now clamped in get_head_pose, so no need for 90-degree check
+                pitch_diff, roll_diff = abs(pitch - self.RESTING_PITCH), abs(roll - self.RESTING_ROLL)
                 head_score = 1.0 if (pitch_diff > self.HEAD_THRESH or roll_diff > self.HEAD_THRESH) else 0.0
 
                 # --- FIX: Calculate Droop Score BEFORE decision logic ---
@@ -202,19 +167,13 @@ class VideoCamera(object):
                 else:
                     # Formula: AI(60%) + Droop(20%) + Yawn(20%)
                     mar_score = 1.0 if mar > self.MOUTH_AR_THRESH else 0.0
-                    score = (avg_prob * 0.6) + (droop_score * 0.3) + (mar_score * 0.1)
+                    score = (avg_prob * 0.6) + (droop_score * 0.2) + (mar_score * 0.2)
                     reason = "FATIGUE" if score > 0.5 else "Active"
 
                 if score > 0.5: status, color = f"WARNING: {reason}", (0, 0, 255)
                 else: status, color = "Active", (0, 255, 0)
 
                 cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                
-                # Draw semi-transparent background for metrics
-                overlay = frame.copy()
-                cv2.rectangle(overlay, (5, 5), (280, 155), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
-                
                 cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
                 cv2.putText(frame, f"AI: {avg_prob:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
                 
